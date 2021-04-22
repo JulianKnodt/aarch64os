@@ -4,9 +4,9 @@ pub trait BlockDevice {
   const NUM_BLOCKS: usize;
   const BLOCK_SIZE: usize;
   /// Read from a block on this device into dst. Returns number of bytes read.
-  fn read(&self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()>;
+  fn read(&mut self, block_num: u32, dst: &mut [u8]) -> Result<usize, ()>;
   /// Write to a block on this device from src. Returns number of bytes written.
-  fn write(&self, block_num: u32, src: &[u8]) -> Result<usize, ()>;
+  fn write(&mut self, block_num: u32, src: &[u8]) -> Result<usize, ()>;
   /// Perform initialization of this block device
   fn init(&mut self) {}
 }
@@ -324,7 +324,7 @@ where
     Ok(())
   }
 
-  pub fn persist(&self) -> Result<(), PersistErr> {
+  pub fn persist(&mut self) -> Result<(), PersistErr> {
     let mut buf = [0; OWN_BLOCKS * B::BLOCK_SIZE];
     // --- write magic number
     buf[..4].copy_from_slice(&u32::to_ne_bytes(MAGIC_NUMBER));
@@ -483,7 +483,7 @@ where
 
   /// Reads from `n`th block of the metadata handle into dst
   pub fn read(
-    &self,
+    &mut self,
     MetadataHandle(i): MetadataHandle,
     n: usize,
     dst: &mut [u8],
@@ -498,7 +498,7 @@ where
 
   /// Writes to the `n`th block of the metadata handle from src
   pub fn write(
-    &self,
+    &mut self,
     MetadataHandle(i): MetadataHandle,
     n: usize,
     src: &[u8],

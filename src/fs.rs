@@ -458,7 +458,8 @@ where
     if fd.mode == FileMode::W {
       return Err(());
     }
-    let inode = self.load_inode(fd.inode as usize)?;
+    let inode_num = fd.inode as usize;
+    let inode = self.load_inode(inode_num)?;
     if inode.kind == INodeKind::Directory {
       assert_eq!(dst.len(), core::mem::size_of::<Directory>());
     }
@@ -481,10 +482,10 @@ where
     self.file_descs[fdi].offset += written as u32;
     Ok(written)
   }
-  pub fn stat(&self, FileDescriptor(fdi): FileDescriptor) -> Result<FileStat, ()> {
+  pub fn stat(&mut self, FileDescriptor(fdi): FileDescriptor) -> Result<FileStat, ()> {
     let fdi = fdi as usize;
-    let fd = self.file_descs.get(fdi).ok_or(())?;
-    let inode = self.load_inode(fd.inode as usize)?;
+    let inode_num = self.file_descs.get(fdi).ok_or(())?.inode as usize;
+    let inode = self.load_inode(inode_num)?;
     Ok(FileStat { size: inode.size })
   }
   #[inline]
@@ -504,7 +505,7 @@ where
     let offset = (i * core::mem::size_of::<INode>()) % B::BLOCK_SIZE;
     (bl, offset, wraps)
   }
-  fn load_inode(&self, i: usize) -> Result<INode, ()> {
+  fn load_inode(&mut self, i: usize) -> Result<INode, ()> {
     assert!(
       self.inode_alloc_map.get(i),
       "Unallocated inode is being loaded"
@@ -530,7 +531,7 @@ where
     }
   }
   #[must_use]
-  fn save_inode(&self, inode: &INode, i: usize) -> Result<(), ()> {
+  fn save_inode(&mut self, inode: &INode, i: usize) -> Result<(), ()> {
     assert!(
       self.inode_alloc_map.get(i as usize),
       "Unallocated inode is being saved"
@@ -706,7 +707,7 @@ where
     Ok(())
   }
   /// Saves the allocation maps to disk
-  fn persist_allocs(&self) -> Result<(), ()> {
+  fn persist_allocs(&mut self) -> Result<(), ()> {
     let mut buf = [0u8; { (NUM_INODE + NUM_DATA) / 8 }];
     assert!(buf.len() < B::BLOCK_SIZE);
     buf[..self.inode_alloc_map.items.len()].copy_from_slice(&self.inode_alloc_map.items);
@@ -804,8 +805,8 @@ where
   /// Function to convert an open file to a directory.
   pub fn modify_kind(&mut self, fd: FileDescriptor, kind: INodeKind) -> Result<(), ()> {
     let fdi = fd.0 as usize;
-    let fde = self.file_descs.get(fdi).ok_or(())?;
-    let mut inode = self.load_inode(fde.inode as usize)?;
+    let inode_num = self.file_descs.get(fdi).ok_or(())?.inode as usize;
+    let mut inode = self.load_inode(inode_num)?;
     match (inode.kind, kind) {
       (a, b) if a == b => return Ok(()),
       // Always fine
@@ -816,7 +817,7 @@ where
         },
     }
     inode.kind = kind;
-    self.save_inode(&inode, fde.inode as usize)?;
+    self.save_inode(&inode, inode_num)?;
     Ok(())
   }
 

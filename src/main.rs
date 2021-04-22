@@ -11,6 +11,7 @@
   const_mut_refs,
   const_fn_transmute,
   const_fn,
+  array_chunks,
   generic_associated_types
 )]
 #![allow(incomplete_features)]
@@ -24,7 +25,11 @@ pub mod bit_array;
 pub mod block_interface;
 pub mod fs;
 
-use virtio::{VirtIODevice, VirtIORegs};
+pub mod impls;
+
+use block_interface::GlobalBlockInterface;
+use core::ptr::read_volatile;
+use virtio::{VirtIOBlkConfig, VirtIODevice, VirtIORegs};
 
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot.S"));
@@ -88,144 +93,159 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
           });
         });
     }
-    uart.as_mut().map(|uart| {
-      let _ = write!(uart, "We booted!\n");
+    let mut uart = if let Some(uart) = uart {
+      uart
+    } else {
+      return;
+    };
 
-      let mut virtio_blk = None;
-      let mut blk_desc = [virtio::VirtQDesc::empty(); 128];
-      let mut blk_avail = virtio::VirtqAvailable::empty();
-      let mut blk_used = virtio::VirtQUsed::empty();
+    let _ = write!(uart, "We booted!\n");
 
-      let mut virtio_entropy = None;
-      let mut entropy_desc = [virtio::VirtQDesc::empty(); 128];
-      let mut entropy_avail = virtio::VirtqAvailable::empty();
-      let mut entropy_used = virtio::VirtQUsed::empty();
+    let mut virtio_blk = None;
+    let mut blk_desc = [virtio::VirtQDesc::empty(); 128];
+    let mut blk_avail = virtio::VirtQAvailable::empty();
+    let mut blk_used = virtio::VirtQUsed::empty();
 
-      for child in root.children_by_prop("compatible", |prop| prop.value == b"virtio,mmio\0") {
-        if let Some(reg) = child.prop_by_name("reg") {
-          let (addr, _rest) = regs_to_usize(reg.value, address_cell);
-          if let Some(virtio) = unsafe { VirtIORegs::new(addr as *mut VirtIORegs) } {
-            match virtio.device_id() {
-              virtio::DeviceId::Blk => {
-                virtio_blk =
-                  virtio::VirtIOBlk::init(virtio, &mut blk_desc, &mut blk_avail, &mut blk_used);
-              },
-              virtio::DeviceId::Entropy => {
-                virtio_entropy = virtio::VirtIOEntropy::init(
-                  virtio,
-                  &mut entropy_desc,
-                  &mut entropy_avail,
-                  &mut entropy_used,
-                );
-              },
-              _ => {},
-            }
+    let mut virtio_entropy = None;
+    let mut entropy_desc = [virtio::VirtQDesc::empty(); 128];
+    let mut entropy_avail = virtio::VirtQAvailable::empty();
+    let mut entropy_used = virtio::VirtQUsed::empty();
+
+    for child in root.children_by_prop("compatible", |prop| prop.value == b"virtio,mmio\0") {
+      if let Some(reg) = child.prop_by_name("reg") {
+        let (addr, _rest) = regs_to_usize(reg.value, address_cell);
+        if let Some(virtio) = unsafe { VirtIORegs::new(addr as *mut VirtIORegs) } {
+          match virtio.device_id() {
+            virtio::DeviceId::Blk => {
+              virtio_blk =
+                virtio::VirtIOBlk::init(virtio, &mut blk_desc, &mut blk_avail, &mut blk_used);
+            },
+            virtio::DeviceId::Entropy => {
+              virtio_entropy = virtio::VirtIOEntropy::init(
+                virtio,
+                &mut entropy_desc,
+                &mut entropy_avail,
+                &mut entropy_used,
+              );
+            },
+            _ => {},
           }
         }
       }
-      loop {
-        let _ = write!(uart, "$> ");
-        let mut buf = [0; 1024];
-        let line = uart.read_line(&mut buf, true);
-        let mut words = line.split(|c| *c == b' ');
-        match words.next() {
-          Some(b"rand") => {
-            let mut data: [u8; 16] = [0; 16];
-            virtio_entropy.as_mut().map(|v| v.read(&mut data));
-            let _ = write!(uart, "Random: {:?}\n", &data);
-          },
-          Some(b"writerand") => {
-            let mut sector = words
-              .next()
-              .and_then(|sec| from_utf8(sec).ok())
-              .and_then(|sec| sec.parse::<u64>().ok())
-              .unwrap_or(0);
-            let mut len = words
-              .next()
-              .and_then(|len| from_utf8(len).ok())
-              .and_then(|len| len.parse::<usize>().ok())
-              .unwrap_or(0);
-            while len > 0 {
-              let mut outdata: [u8; 512] = [0; 512];
-              let curlen = core::cmp::min(512, len);
-              {
-                let curbuf = &mut outdata[..curlen];
-                virtio_entropy.as_mut().map(|v| v.read(curbuf));
-                for b in curbuf.iter_mut() {
-                  *b = ((*b as u32 * 100) / 272 + 32) as u8;
+    }
+
+    let virtio_blk_cfg: VirtIOBlkConfig = unsafe {
+      read_volatile(&virtio_blk.as_ref().unwrap().regs.config.native() as *const u64 as *const _)
+    };
+    let _ = write!(uart, "Capacity {:?}\n", virtio_blk_cfg);
+
+    // let gbi = GlobalBlockInterface::new(virtio_blk.unwrap());
+
+    loop {
+      let _ = write!(uart, "$> ");
+      let mut buf = [0; 1024];
+      let line = uart.read_line(&mut buf, true);
+      let mut words = line.split(|c| *c == b' ');
+      let word = if let Some(word) = words.next() {
+        word
+      } else {
+        continue;
+      };
+      match word {
+        b"rand" => {
+          let mut data: [u8; 16] = [0; 16];
+          virtio_entropy.as_mut().map(|v| v.read(&mut data));
+          let _ = write!(uart, "Random: {:?}\n", &data);
+        },
+        b"writerand" => {
+          let mut sector = words
+            .next()
+            .and_then(|sec| from_utf8(sec).ok())
+            .and_then(|sec| sec.parse::<u64>().ok())
+            .unwrap_or(0);
+          let mut len = words
+            .next()
+            .and_then(|len| from_utf8(len).ok())
+            .and_then(|len| len.parse::<usize>().ok())
+            .unwrap_or(0);
+          while len > 0 {
+            let mut outdata: [u8; 512] = [0; 512];
+            let curlen = core::cmp::min(512, len);
+            {
+              let curbuf = &mut outdata[..curlen];
+              virtio_entropy.as_mut().map(|v| v.read(curbuf));
+              for b in curbuf.iter_mut() {
+                *b = ((*b as u32 * 100) / 272 + 32) as u8;
+              }
+            }
+            virtio_blk.as_mut().map(|v| v.write(sector, &outdata));
+            sector += 1;
+            len -= curlen;
+          }
+        },
+        b"read" => {
+          let sector = words
+            .next()
+            .and_then(|sec| from_utf8(sec).ok())
+            .and_then(|sec| sec.parse::<u64>().ok())
+            .unwrap_or(0);
+          let mut len = words
+            .next()
+            .and_then(|len| from_utf8(len).ok())
+            .and_then(|len| len.parse::<usize>().ok())
+            .unwrap_or(512);
+          let mut data: [u8; 512] = [0; 512];
+          loop {
+            virtio_blk.as_mut().map(|v| v.read(sector, &mut data));
+            if len > 512 {
+              uart.write_bytes(&data);
+              len -= 512;
+            } else {
+              uart.write_bytes(&data[..len]);
+              uart.write_byte(b'\n');
+              break;
+            }
+          }
+        },
+        b"write" => {
+          let mut sector = words
+            .next()
+            .and_then(|sec| from_utf8(sec).ok())
+            .and_then(|sec| sec.parse::<u64>().ok())
+            .unwrap_or(0);
+          let mut len = words
+            .next()
+            .and_then(|len| from_utf8(len).ok())
+            .and_then(|len| len.parse::<usize>().ok())
+            .unwrap_or(0);
+          while len > 0 {
+            let mut outdata: [u8; 512] = [0; 512];
+            let curlen = core::cmp::min(512, len);
+            {
+              let curbuf = &mut outdata[..curlen];
+              for b in curbuf.iter_mut() {
+                *b = uart.read_byte();
+                if *b == b'\r' {
+                  *b = b'\n';
                 }
-              }
-              virtio_blk.as_mut().map(|v| v.write(sector, &outdata));
-              sector += 1;
-              len -= curlen;
-            }
-          },
-          Some(b"read") => {
-            let sector = words
-              .next()
-              .and_then(|sec| from_utf8(sec).ok())
-              .and_then(|sec| sec.parse::<u64>().ok())
-              .unwrap_or(0);
-            let mut len = words
-              .next()
-              .and_then(|len| from_utf8(len).ok())
-              .and_then(|len| len.parse::<usize>().ok())
-              .unwrap_or(512);
-            let mut data: [u8; 512] = [0; 512];
-            loop {
-              virtio_blk.as_mut().map(|v| v.read(sector, &mut data));
-              if len > 512 {
-                uart.write_bytes(&data);
-                len -= 512;
-              } else {
-                uart.write_bytes(&data[..len]);
-                uart.write_byte(b'\n');
-                break;
+                uart.write_byte(*b);
               }
             }
-          },
-          Some(b"write") => {
-            let mut sector = words
-              .next()
-              .and_then(|sec| from_utf8(sec).ok())
-              .and_then(|sec| sec.parse::<u64>().ok())
-              .unwrap_or(0);
-            let mut len = words
-              .next()
-              .and_then(|len| from_utf8(len).ok())
-              .and_then(|len| len.parse::<usize>().ok())
-              .unwrap_or(0);
-            while len > 0 {
-              let mut outdata: [u8; 512] = [0; 512];
-              let curlen = core::cmp::min(512, len);
-              {
-                let curbuf = &mut outdata[..curlen];
-                for b in curbuf.iter_mut() {
-                  *b = uart.read_byte();
-                  if *b == b'\r' {
-                    *b = b'\n';
-                  }
-                  uart.write_byte(*b);
-                }
-              }
-              virtio_blk.as_mut().map(|v| v.write(sector, &outdata));
-              sector += 1;
-              len -= curlen;
-            }
-          },
-          Some(b"exit") => {
-            break;
-          },
-          _ => {
-            let _ = write!(
-              uart,
-              "Unknown command \"{}\"\n",
-              from_utf8(line).unwrap_or("unknown")
-            );
-          },
-        }
+            virtio_blk.as_mut().map(|v| v.write(sector, &outdata));
+            sector += 1;
+            len -= curlen;
+          }
+        },
+        b"exit" => break,
+        _ => {
+          let _ = write!(
+            uart,
+            "Unknown command \"{}\"\n",
+            from_utf8(line).unwrap_or("unknown")
+          );
+        },
       }
-    });
+    }
   }
 }
 

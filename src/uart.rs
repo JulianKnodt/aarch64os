@@ -27,6 +27,13 @@ impl UART {
     }
   }
 
+  /// Moves the cursor to the left.
+  fn move_back(&mut self) {
+    self.write_byte(0x1b);
+    self.write_byte(0x5b);
+    self.write_byte(0x44);
+  }
+
   pub fn read_line<'a>(&mut self, buf: &'a mut [u8], echo: bool) -> &'a [u8] {
     let mut max_len = buf.len();
     let mut count = 0;
@@ -38,7 +45,9 @@ impl UART {
             count -= 1;
             buf[count] = 0;
             max_len += 1;
-            self.write_byte(127u8);
+            self.move_back();
+            self.write_byte(b' ');
+            self.move_back();
           },
         v => {
           if echo {

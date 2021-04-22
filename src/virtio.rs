@@ -36,9 +36,11 @@ pub enum DeviceId {
   NinePTransport = 9,
 }
 
+type LEU16 = Endian<u16, Little>;
 type LEU32 = Endian<u32, Little>;
 type LEU64 = Endian<u64, Little>;
 
+#[derive(Clone, Debug)]
 #[repr(C)]
 pub struct VirtIORegs {
   pub magic: LEU32,
@@ -79,7 +81,7 @@ pub struct VirtIORegs {
 
 const MAGIC: u32 = 0x74726976;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C, align(16))]
 pub struct VirtQDesc {
   addr: LEU64,
@@ -99,18 +101,18 @@ impl VirtQDesc {
   }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C, align(2))]
-pub struct VirtqAvailable {
+pub struct VirtQAvailable {
   flags: Endian<u16, Little>,
   idx: Endian<u16, Little>,
   ring: [Endian<u16, Little>; 128],
   used_event: Endian<u16, Little>,
 }
 
-impl VirtqAvailable {
-  pub const fn empty() -> VirtqAvailable {
-    VirtqAvailable {
+impl VirtQAvailable {
+  pub const fn empty() -> VirtQAvailable {
+    VirtQAvailable {
       flags: Endian::from_raw(0),
       idx: Endian::from_raw(0),
       ring: [Endian::from_raw(0); 128],
@@ -119,7 +121,7 @@ impl VirtqAvailable {
   }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
 struct VirtQUsedElement {
   id: Endian<u16, Little>,
@@ -135,7 +137,7 @@ impl VirtQUsedElement {
   }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C, align(4))]
 pub struct VirtQUsed {
   flags: Endian<u16, Little>,
@@ -188,14 +190,14 @@ pub trait VirtIODevice<'a>: Sized {
   unsafe fn new(
     regs: &'a mut VirtIORegs,
     desc: &'a mut [VirtQDesc],
-    avail: &'a mut VirtqAvailable,
+    avail: &'a mut VirtQAvailable,
     used: &'a mut VirtQUsed,
   ) -> Self;
 
   fn init(
     regs: &'a mut VirtIORegs,
     desc: &'a mut [VirtQDesc],
-    avail: &'a mut VirtqAvailable,
+    avail: &'a mut VirtQAvailable,
     used: &'a mut VirtQUsed,
   ) -> Option<Self> {
     unsafe {
@@ -251,20 +253,53 @@ pub trait VirtIODevice<'a>: Sized {
       write_volatile(&mut regs.status, Status::DriverOk.into());
       mb();
       if read_volatile(&mut regs.status).native() & (Status::DriverOk as u32) == 0 {
-        panic!("Coudln't set blk features");
+        panic!("Couldn't set blk features");
       }
       Some(Self::new(regs, desc, avail, used))
     }
   }
 }
 
-const BLK_DEVICE_FEATURES: u32 = 0;
+/// Feature Bit
+const fn fb(b: u8) -> u32 { 1 << b }
+const BLK_DEVICE_FEATURES: u32 = fb(1) | !fb(5) | fb(2);
 
+#[derive(Debug)]
 pub struct VirtIOBlk<'a> {
-  regs: &'a mut VirtIORegs,
+  pub regs: &'a mut VirtIORegs,
   desc: &'a mut [VirtQDesc],
-  avail: &'a mut VirtqAvailable,
+  avail: &'a mut VirtQAvailable,
   used: &'a mut VirtQUsed,
+}
+
+#[derive(Debug)]
+pub struct VirtIOBlkConfig {
+  capacity: LEU64,
+  size_max: LEU32,
+  seg_max: LEU32,
+
+  // geometry
+  cylinders: LEU16,
+  heads: u8,
+  sectors: u8,
+
+  blk_size: LEU32,
+
+  // topology
+  physical_block_exp: u8,
+  alignment_offset: u8,
+  min_io_size: LEU16,
+  optimal_io_size: LEU32,
+
+  writeback: u8,
+  _unused0: [u8; 3],
+  max_discard_sectors: LEU32,
+  max_discard_seg: LEU32,
+  discard_sector_alignment: LEU32,
+  max_write_zeroes_sectors: LEU32,
+  max_write_zeroes_seg: LEU32,
+  write_zeroes_may_unmap: u8,
+  _unused1: [u8; 3],
 }
 
 #[repr(C)]
@@ -278,7 +313,7 @@ impl<'a> VirtIODevice<'a> for VirtIOBlk<'a> {
   unsafe fn new(
     regs: &'a mut VirtIORegs,
     desc: &'a mut [VirtQDesc],
-    avail: &'a mut VirtqAvailable,
+    avail: &'a mut VirtQAvailable,
     used: &'a mut VirtQUsed,
   ) -> Self {
     VirtIOBlk {
@@ -385,7 +420,7 @@ impl<'a> VirtIOBlk<'a> {
 pub struct VirtIOEntropy<'a> {
   regs: &'a mut VirtIORegs,
   desc: &'a mut [VirtQDesc],
-  avail: &'a mut VirtqAvailable,
+  avail: &'a mut VirtQAvailable,
   used: &'a mut VirtQUsed,
 }
 
@@ -393,7 +428,7 @@ impl<'a> VirtIODevice<'a> for VirtIOEntropy<'a> {
   unsafe fn new(
     regs: &'a mut VirtIORegs,
     desc: &'a mut [VirtQDesc],
-    avail: &'a mut VirtqAvailable,
+    avail: &'a mut VirtQAvailable,
     used: &'a mut VirtQUsed,
   ) -> Self {
     VirtIOEntropy {
