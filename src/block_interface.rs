@@ -11,6 +11,20 @@ pub trait BlockDevice {
   fn init(&mut self) {}
 }
 
+pub trait Zeroable: BlockDevice {
+  fn zero(&mut self, block_num: u32) -> Result<usize, ()>;
+}
+
+default impl<T> Zeroable for T
+where
+  T: BlockDevice,
+  [(); T::BLOCK_SIZE]: ,
+{
+  fn zero(&mut self, block_num: u32) -> Result<usize, ()> {
+    self.write(block_num, &[0; Self::BLOCK_SIZE])
+  }
+}
+
 #[macro_export]
 macro_rules! default_ser_impl {
   () => {
@@ -286,7 +300,10 @@ where
     for i in 0..OWN_BLOCKS {
       let read = self
         .block_device
-        .read(i as u32, &mut buf[i * B::BLOCK_SIZE..])
+        .read(
+          i as u32,
+          &mut buf[i * B::BLOCK_SIZE..(i + 1) * B::BLOCK_SIZE],
+        )
         .map_err(|_| InitErr::FailedToRead)?;
       assert_eq!(read, B::BLOCK_SIZE);
     }

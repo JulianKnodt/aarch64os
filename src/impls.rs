@@ -1,7 +1,9 @@
 use crate::{block_interface::BlockDevice, virtio::VirtIOBlk};
 
 impl BlockDevice for VirtIOBlk<'_> {
-  const NUM_BLOCKS: usize = 1000;
+  // This is a size I randomly picked when allocating the image file.
+  const NUM_BLOCKS: usize = 2048;
+
   const BLOCK_SIZE: usize = 512;
   fn read(&mut self, start_sector_num: u32, dst: &mut [u8]) -> Result<usize, ()> {
     let mut arr_chunk = dst.array_chunks_mut::<512>();

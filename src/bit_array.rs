@@ -16,6 +16,7 @@ where
     BitArray {
       items: [token; nearest_div_8(N)],
     }
+    // TODO mask out last token
   }
   /// Sets bit `i` in this bit array.
   pub const fn set(&mut self, i: usize) { self.items[i / 8] |= 1 << (i % 8); }
@@ -33,7 +34,6 @@ where
         .enumerate()
         .find(|(_, &v)| v != 0xff)
         .map(|(i, v)| {
-          // TODO is this leading or trailing ones?
           i * 8 + v.trailing_ones() as usize
         });
     }
@@ -44,7 +44,6 @@ where
       .enumerate()
       .find(|(_, &v)| v != 0xff)
       .map(|(i, v)| {
-        // TODO is this leading or trailing ones?
         i * 8 + v.trailing_ones() as usize
       })
       .or_else(|| {
@@ -59,11 +58,48 @@ where
       })
   }
 
+  /// Iterates through this bit array trying to find the first free block in a contiguous range,
+  /// returning none if there are none.
+  pub fn find_free_contiguous(&self, contiguous: u32) -> Option<usize> {
+    if N % 8 != 0 {
+      todo!()
+    }
+
+    let mut first = 0;
+    let mut acc = 0;
+    for (i, &v) in self.items.iter().enumerate() {
+      let mut shifted = 0;
+      let mut curr = v;
+      while shifted < u8::BITS {
+        let to_shift = curr.trailing_zeros().min(u8::BITS - shifted);
+        if acc + to_shift >= contiguous {
+          return Some(first)
+        } else if to_shift == u8::BITS - shifted {
+          acc += to_shift;
+          break
+        } else {
+          acc = 0;
+          shifted += to_shift + 1;
+          curr = v.checked_shr(shifted).unwrap_or(0);
+          first = i * 8 + shifted as usize;
+        }
+      }
+      if acc > contiguous {
+        return Some(first)
+      }
+    }
+    return None
+  }
+
+
+
   #[inline]
   pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
     // TODO make more efficient?
     (0..N).map(move |i| self.get(i))
   }
+
+  #[inline]
   pub fn num_free(&self) -> u32 {
     if N % 8 == 0 {
       return self.items.iter().map(|v| v.count_zeros()).sum::<u32>();
@@ -77,5 +113,3 @@ where
       + self.items.last().unwrap().count_zeros().min((N % 8) as u32)
   }
 }
-
-// TODO write some tests for this to ensure it works

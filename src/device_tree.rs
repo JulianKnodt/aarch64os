@@ -1,9 +1,10 @@
-use core::{fmt, iter::Iterator};
+use core::iter::Iterator;
 
 use crate::utils::*;
 
 type BE = Endian<u32, Big>;
 
+#[derive(Debug)]
 #[repr(C)]
 pub struct DeviceTree {
   magic: BE,
@@ -16,31 +17,6 @@ pub struct DeviceTree {
   boot_cpuid: BE,
   dt_strings_size: BE,
   dt_struct_size: BE,
-}
-
-impl fmt::Debug for DeviceTree {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    f.write_str("Header {\n")?;
-    write!(f, "  magic: {:#x}\n", self.magic)?;
-    write!(f, "  total_size: {:#x}\n", self.total_size)?;
-    write!(f, "  dt_struct_offset: {}\n", self.dt_struct_offset)?;
-    write!(f, "  dt_strings_offset: {}\n", self.dt_strings_offset)?;
-    write!(
-      f,
-      "  memory_reserve_map_offset: {}\n",
-      self.memory_reserve_map_offset
-    )?;
-    write!(f, "  version: {}\n", self.version)?;
-    write!(
-      f,
-      "  last_compatible_version: {}\n",
-      self.last_compatible_version
-    )?;
-    write!(f, "  boot_cpuid: {}\n", self.boot_cpuid)?;
-    write!(f, "  dt_strings_size: {}\n", self.dt_strings_size)?;
-    write!(f, "  dt_struct_size: {}\n", self.dt_struct_size)?;
-    f.write_str("}")
-  }
 }
 
 impl DeviceTree {
@@ -173,19 +149,19 @@ impl<'a> Node<'a> {
     self.children().find(|node| node.name == name)
   }
 
-  fn child_by_path_helper<'b, I: Iterator<Item = &'b [u8]>>(self, mut path: I) -> Option<Node<'a>> {
+  fn child_by_path_helper<'b, I: Iterator<Item = &'b [u8]>>(self, mut path: I) -> Node<'a> {
     path
       .next()
       .and_then(|cur| {
         self
           .children()
           .find(|node| node.name == cur)
-          .and_then(|next| next.child_by_path_helper(path))
+          .map(|next| next.child_by_path_helper(path))
       })
-      .or(Some(self))
+      .unwrap_or(self)
   }
 
-  pub fn child_by_path<B: 'a + AsRef<[u8]>>(self, name: B) -> Option<Node<'a>> {
+  pub fn child_by_path<B: 'a + AsRef<[u8]>>(self, name: B) -> Node<'a> {
     let mut path = name.as_ref().split(|c| *c == b'/');
     if name.as_ref().first() == Some(&b'/') {
       path.next();

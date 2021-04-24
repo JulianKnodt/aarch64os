@@ -12,6 +12,8 @@
   const_fn_transmute,
   const_fn,
   array_chunks,
+  const_generics_defaults,
+  specialization,
   generic_associated_types
 )]
 #![allow(incomplete_features)]
@@ -34,7 +36,11 @@ use virtio::{VirtIOBlkConfig, VirtIODevice, VirtIORegs};
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot.S"));
 
-use core::{fmt::Write, panic::PanicInfo, str::from_utf8};
+use core::{
+  fmt::Write,
+  panic::PanicInfo,
+  str::{from_utf8, FromStr},
+};
 
 fn null_terminated_str(bytes: &[u8]) -> &[u8] {
   if bytes[bytes.len() - 1] == 0 {
@@ -82,15 +88,14 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
         .map(|stdout_path| null_terminated_str(stdout_path.value))
         .filter(|stdout_path| stdout_path == b"/pl011@9000000")
         .map(|stdout_path| {
-          root.child_by_path(stdout_path).map(|stdout| {
-            if let Some(reg) = stdout.prop_by_name("reg") {
-              let (addr, rest) = regs_to_usize(reg.value, address_cell);
-              let (size, _) = regs_to_usize(rest, size_cell);
-              if size == 0x1000 {
-                uart = Some(unsafe { uart::UART::new(addr as _) });
-              }
+          let stdout = root.child_by_path(stdout_path);
+          if let Some(reg) = stdout.prop_by_name("reg") {
+            let (addr, rest) = regs_to_usize(reg.value, address_cell);
+            let (size, _) = regs_to_usize(rest, size_cell);
+            if size == 0x1000 {
+              uart = Some(unsafe { uart::UART::new(addr as _) });
             }
-          });
+          }
         });
     }
     let mut uart = if let Some(uart) = uart {
@@ -134,12 +139,20 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
       }
     }
 
+    let mut virtio_entropy = virtio_entropy.unwrap();
+
     let virtio_blk_cfg: VirtIOBlkConfig = unsafe {
       read_volatile(&virtio_blk.as_ref().unwrap().regs.config.native() as *const u64 as *const _)
     };
     let _ = write!(uart, "Capacity {:?}\n", virtio_blk_cfg);
 
-    // let gbi = GlobalBlockInterface::new(virtio_blk.unwrap());
+    let mut gbi = GlobalBlockInterface::new(virtio_blk.unwrap());
+    gbi.try_init().expect("Failed to init");
+    let mut fs = fs::FileSystem::new(&mut gbi);
+
+    let mut curr_dir = fs
+      .root_dir(fs::FileMode::RW)
+      .expect("Failed to get root directory");
 
     loop {
       let _ = write!(uart, "$> ");
@@ -152,9 +165,73 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
         continue;
       };
       match word {
+        b"ls" => {
+          let dir = fs.as_directory(curr_dir).unwrap();
+          let entries = dir
+            .entries()
+            .map(|v| v.0)
+            .map(|name| core::str::from_utf8(name).unwrap());
+          for name in entries {
+            let _ = write!(uart, "{}\n", name);
+          }
+        },
+        b"open" => {
+          let w = words.next().and_then(|w| core::str::from_utf8(w).ok());
+          let file_name = if let Some(word) = w {
+            word
+          } else {
+            let _ = writeln!(uart, "Usage: open <file_name> <kind=RW>");
+            continue;
+          };
+          let mode = words
+            .next()
+            .and_then(|w| core::str::from_utf8(w).ok())
+            .and_then(|w| fs::FileMode::from_str(w).ok())
+            .unwrap_or(fs::FileMode::RW);
+          let fd = match fs.open(curr_dir, &[file_name], mode) {
+            Ok(fd) => fd,
+            Err(err) => {
+              let _ = writeln!(uart, "Open failed: {:?}", err);
+              continue;
+            },
+          };
+          let _ = writeln!(uart, "Opened file: {:?}", fd);
+        },
+        b"mkdir" => {
+          let w = words.next().and_then(|w| core::str::from_utf8(w).ok());
+          let dir_name = if let Some(word) = w {
+            word
+          } else {
+            let _ = write!(uart, "Usage: mkdir <dir>");
+            continue;
+          };
+          if let Err(e) = fs.mkdir(curr_dir, dir_name) {
+            let _ = write!(uart, "mkdir failed: {:?}\n", e);
+          }
+        },
+        b"rmdir" => {
+          todo!();
+        },
+        b"cd" => {
+          let w = words.next().and_then(|w| core::str::from_utf8(w).ok());
+          let dir_name = if let Some(word) = w {
+            word
+          } else {
+            curr_dir = fs.root_dir(fs::FileMode::RW).unwrap();
+            continue;
+          };
+          let next_dir = match fs.open(curr_dir, &[dir_name], fs::FileMode::MustExist) {
+            Ok(v) => v,
+            Err(e) => {
+              let _ = write!(uart, "cd failed: {:?}\n", e);
+              continue;
+            },
+          };
+          curr_dir = next_dir;
+        },
         b"rand" => {
           let mut data: [u8; 16] = [0; 16];
-          virtio_entropy.as_mut().map(|v| v.read(&mut data));
+          virtio_entropy.read(&mut data);
           let _ = write!(uart, "Random: {:?}\n", &data);
         },
         b"writerand" => {
@@ -173,12 +250,12 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
             let curlen = core::cmp::min(512, len);
             {
               let curbuf = &mut outdata[..curlen];
-              virtio_entropy.as_mut().map(|v| v.read(curbuf));
+              virtio_entropy.read(curbuf);
               for b in curbuf.iter_mut() {
                 *b = ((*b as u32 * 100) / 272 + 32) as u8;
               }
             }
-            virtio_blk.as_mut().map(|v| v.write(sector, &outdata));
+            //gbi.block_device.write(sector, &outdata);
             sector += 1;
             len -= curlen;
           }
@@ -196,7 +273,7 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
             .unwrap_or(512);
           let mut data: [u8; 512] = [0; 512];
           loop {
-            virtio_blk.as_mut().map(|v| v.read(sector, &mut data));
+            //gbi.block_device.read(sector, &mut data);
             if len > 512 {
               uart.write_bytes(&data);
               len -= 512;
@@ -207,17 +284,34 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
             }
           }
         },
-        b"write" => {
-          let mut sector = words
-            .next()
-            .and_then(|sec| from_utf8(sec).ok())
-            .and_then(|sec| sec.parse::<u64>().ok())
-            .unwrap_or(0);
+        b"fwriterand" => {
+          let mut file_name = words.next().and_then(|v| from_utf8(v).ok());
+          let file_name = if let Some(file_name) = file_name {
+            file_name
+          } else {
+            let _ = writeln!(uart, "Usage: fwrite <filename> <len=512>");
+            continue;
+          };
+
           let mut len = words
             .next()
             .and_then(|len| from_utf8(len).ok())
             .and_then(|len| len.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or(512);
+
+          let fd = match fs.open(curr_dir, &[file_name], fs::FileMode::RW) {
+            Ok(fd) => fd,
+            Err(()) => {
+              let _ = writeln!(uart, "Failed to open {}", file_name);
+              continue;
+            },
+          };
+
+          // just read from entropy for now for now;
+          let mut data = [0u8; 512];
+          virtio_entropy.read(&mut data);
+          let _ = write!(uart, "Random: {:?}\n", &data);
+
           while len > 0 {
             let mut outdata: [u8; 512] = [0; 512];
             let curlen = core::cmp::min(512, len);
@@ -231,8 +325,7 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
                 uart.write_byte(*b);
               }
             }
-            virtio_blk.as_mut().map(|v| v.write(sector, &outdata));
-            sector += 1;
+            //gbi.block_device.write(sector, &outdata);
             len -= curlen;
           }
         },

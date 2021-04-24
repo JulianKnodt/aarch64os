@@ -325,12 +325,21 @@ impl<'a> VirtIODevice<'a> for VirtIOBlk<'a> {
   }
 }
 
+#[repr(u32)]
+#[derive(Debug, Clone, Copy)]
+pub enum VirtIOBlkTy {
+  Read = 0,
+  Write = 1,
+
+  WriteZero = 13,
+}
+
 impl<'a> VirtIOBlk<'a> {
   pub fn read(&mut self, sector: u64, data: &mut [u8; 512]) {
     unsafe {
       let mut status: u8 = 0;
       let blkreq_hdr = BlkReqHdr {
-        req_type: 0.into(),
+        req_type: (VirtIOBlkTy::Read as u32).into(),
         reserved: 0,
         sector: sector.into(),
       };
@@ -347,7 +356,7 @@ impl<'a> VirtIOBlk<'a> {
       write_volatile(&mut self.desc[1], VirtQDesc {
         addr: (data.as_ptr() as *const _ as u64).into(),
         len: (512).into(),
-        flags: (3).into(),
+        flags: 3.into(),
         next: 2.into(),
       });
 
@@ -359,15 +368,18 @@ impl<'a> VirtIOBlk<'a> {
       });
 
       write_volatile(
-        &mut self.avail.ring[self.avail.idx.native() as usize],
+        &mut self.avail.ring[self.avail.idx.native() as usize % 128],
         0.into(),
       );
       mb();
-      write_volatile(&mut self.avail.idx, (self.avail.idx.native() + 1).into());
+      write_volatile(
+        &mut self.avail.idx,
+        (self.avail.idx.native().wrapping_add(1)).into(),
+      );
       mb();
       write_volatile(&mut self.regs.queue_notify, 0.into());
       mb();
-      while read_volatile(&self.used.idx).native() != read_volatile(&self.avail.idx).native() {}
+      while read_volatile(&self.used.idx) != read_volatile(&self.avail.idx) {}
     }
   }
 
@@ -375,7 +387,7 @@ impl<'a> VirtIOBlk<'a> {
     unsafe {
       let mut status: u8 = 0;
       let blkreq_hdr = BlkReqHdr {
-        req_type: 1.into(),
+        req_type: (VirtIOBlkTy::Write as u32).into(),
         reserved: 0,
         sector: sector.into(),
       };
@@ -404,15 +416,18 @@ impl<'a> VirtIOBlk<'a> {
       });
 
       write_volatile(
-        &mut self.avail.ring[self.avail.idx.native() as usize],
+        &mut self.avail.ring[self.avail.idx.native() as usize % 128],
         0.into(),
       );
       mb();
-      write_volatile(&mut self.avail.idx, (self.avail.idx.native() + 1).into());
+      write_volatile(
+        &mut self.avail.idx,
+        (self.avail.idx.native().wrapping_add(1)).into(),
+      );
       mb();
       write_volatile(&mut self.regs.queue_notify, 0.into());
       mb();
-      while read_volatile(&self.used.idx).native() != read_volatile(&self.avail.idx).native() {}
+      while read_volatile(&self.used.idx) != read_volatile(&self.avail.idx) {}
     }
   }
 }

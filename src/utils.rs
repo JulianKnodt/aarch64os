@@ -44,9 +44,9 @@ impl<T: HasEndianness, E: Endianness> Endian<T, E> {
   pub fn raw(self) -> T { self.0 }
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(PartialEq, Eq, Copy, Clone, Default)]
 pub struct Big;
-#[derive(Copy, Clone, Default)]
+#[derive(PartialEq, Eq, Copy, Clone, Default)]
 pub struct Little;
 
 pub trait Endianness {
