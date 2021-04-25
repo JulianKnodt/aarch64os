@@ -329,7 +329,10 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
             len -= curlen;
           }
         },
-        b"exit" => break,
+        b"exit" => {
+          fs.flush();
+          break
+        },
         _ => {
           let _ = write!(
             uart,

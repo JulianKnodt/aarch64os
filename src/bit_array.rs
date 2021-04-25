@@ -33,9 +33,7 @@ where
         .iter()
         .enumerate()
         .find(|(_, &v)| v != 0xff)
-        .map(|(i, v)| {
-          i * 8 + v.trailing_ones() as usize
-        });
+        .map(|(i, v)| i * 8 + v.trailing_ones() as usize);
     }
     self
       .items
@@ -43,9 +41,7 @@ where
       .take(N - 1)
       .enumerate()
       .find(|(_, &v)| v != 0xff)
-      .map(|(i, v)| {
-        i * 8 + v.trailing_ones() as usize
-      })
+      .map(|(i, v)| i * 8 + v.trailing_ones() as usize)
       .or_else(|| {
         // need to handle last item which may not be full byte
         let rem = N % 8;
@@ -73,10 +69,10 @@ where
       while shifted < u8::BITS {
         let to_shift = curr.trailing_zeros().min(u8::BITS - shifted);
         if acc + to_shift >= contiguous {
-          return Some(first)
+          return Some(first);
         } else if to_shift == u8::BITS - shifted {
           acc += to_shift;
-          break
+          break;
         } else {
           acc = 0;
           shifted += to_shift + 1;
@@ -85,13 +81,11 @@ where
         }
       }
       if acc > contiguous {
-        return Some(first)
+        return Some(first);
       }
     }
-    return None
+    return None;
   }
-
-
 
   #[inline]
   pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {

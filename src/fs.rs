@@ -1,4 +1,5 @@
 use crate::{
+  array_vec::ArrayVec,
   bit_array::{nearest_div_8, BitArray},
   block_interface::{
     AllMetadata, BlockDevice, GlobalBlockInterface, Metadata, MetadataHandle, Owner,
@@ -348,6 +349,10 @@ where
   open_counts: [u8; NUM_INODE],
   inode_md: MetadataHandle,
   data_md: MetadataHandle,
+
+  /// A cache for commonly written inodes so we don't have to go to disk everytime.
+  inode_cache: ArrayVec<(INode, u32), 4>,
+
   // These are pub(crate) so that they can be looked at.
   pub(crate) inode_alloc_map: BitArray<512>,
   pub(crate) data_alloc_map: BitArray<1024>,
@@ -381,6 +386,7 @@ where
         inode_md: inode_mh,
         data_md: data_mh,
         open_counts: [0; NUM_INODE],
+        inode_cache: ArrayVec::new(),
         inode_alloc_map: BitArray::new(false),
         data_alloc_map: BitArray::new(false),
         file_descs: [FileDescEntry::default(); 256],
@@ -426,6 +432,7 @@ where
       superblock: sb_mh,
       inode_md: inode_mh,
       data_md: data_mh,
+      inode_cache: ArrayVec::new(),
       inode_alloc_map: BitArray::new(false),
       data_alloc_map: BitArray::new(false),
       file_descs: [FileDescEntry::default(); 256],
@@ -461,6 +468,14 @@ where
     fd.offset = 0;
     fd.mode = mode;
     Ok(FileDescriptor(i as u32))
+  }
+
+  /// Flushes the cache to ensure that all writes are persisted.
+  pub fn flush(&mut self) -> Result<(), ()> {
+    while let Some((inode, inode_num)) = self.inode_cache.pop() {
+      self.save_inode(&inode, inode_num as usize)?;
+    }
+    Ok(())
   }
   /// Seeks inside of a file
   pub fn seek(&mut self, FileDescriptor(fdi): FileDescriptor, s: SeekFrom) -> Result<(), ()> {
@@ -554,14 +569,20 @@ where
       "Unallocated inode is being loaded {}",
       i
     );
+    if let Some((inode, _)) = self
+      .inode_cache
+      .as_slice()
+      .iter()
+      .find(|(_, num)| *num as usize == i)
+    {
+      return Ok(inode.clone());
+    }
     let (block, offset, overlaps_end) = Self::inode_block_and_offset_and_wraps(i);
     if !overlaps_end {
       let mut buf = [0; B::BLOCK_SIZE];
       let inode_end = offset + core::mem::size_of::<INode>();
       self.gbi.read(self.inode_md, block, &mut buf[..inode_end])?;
-      Ok(INode::from_slice(
-        &buf[offset..inode_end],
-      ))
+      Ok(INode::from_slice(&buf[offset..inode_end]))
     } else {
       let mut buf = [0u8; 2 * B::BLOCK_SIZE];
       self
@@ -574,6 +595,22 @@ where
         &buf[offset..offset + core::mem::size_of::<INode>()],
       ))
     }
+  }
+
+  fn cache_inode(&mut self, inode: &INode, i: usize) -> Result<(), ()> {
+    if let Some((prev, _)) = self
+      .inode_cache
+      .as_mut_slice()
+      .iter_mut()
+      .find(|(_, v)| *v as usize == i)
+    {
+      prev.clone_from(inode);
+      return Ok(());
+    }
+    if let Some((old, i)) = self.inode_cache.push_out_front((*inode, i as u32)) {
+      self.save_inode(&old, i as usize)?;
+    }
+    Ok(())
   }
 
   fn save_inode(&mut self, inode: &INode, i: usize) -> Result<(), ()> {
@@ -767,8 +804,12 @@ where
   }
 
   /// Writes a byte array to an inode
-  fn write_to_inode(&mut self, inode: &mut INode, data: &[u8], offset: u32) -> Result<(usize,
-  bool), ()> {
+  fn write_to_inode(
+    &mut self,
+    inode: &mut INode,
+    data: &[u8],
+    offset: u32,
+  ) -> Result<(usize, bool), ()> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
     let end_byte = offset + data.len() as u32;
     let updated = inode.size < end_byte;
