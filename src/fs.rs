@@ -189,7 +189,6 @@ pub struct INode {
   refs: u16,
   kind: INodeKind,
   size: u32,
-  // TODO think of a way to extend the size of data blocks here
   data_blocks: [u16; 8],
 }
 
@@ -229,6 +228,12 @@ impl INode {
       let [l, r] = self.data_blocks[i].to_ne_bytes();
       dst[7 + i * 2] = l;
       dst[8 + i * 2] = r;
+    }
+  }
+  fn data_block(&self, mut n: usize) -> u16 {
+    let mut curr = data_blocks[0];
+    while n > 0 {
+
     }
   }
 }

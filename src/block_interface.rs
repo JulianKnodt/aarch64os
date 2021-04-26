@@ -161,7 +161,7 @@ macro_rules! mk_metadata_enum {
           $( Self::$md_id(_) => <$md as Metadata>::LEN, )+
         }
       }
-      pub fn is_empty(&self) -> usize { self.len() == 0 }
+      pub fn is_empty(&self) -> bool { self.len() == 0 }
       pub fn ser(&self) -> &[u8] {
         match self {
           $( Self::$md_id(v) => v.ser(),  )+
