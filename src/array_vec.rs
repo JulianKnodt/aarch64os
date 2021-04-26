@@ -60,4 +60,9 @@ impl<T, const N: usize> ArrayVec<T, N, u8> {
     );
     Some(unsafe { old.assume_init() })
   }
+  pub fn remove_where(&mut self, pred: impl FnMut(&T) -> bool) -> Option<T> {
+    let p = self.as_slice().iter().position(pred)?;
+    self.items[p..self.curr_len as usize].rotate_left(1);
+    self.pop()
+  }
 }

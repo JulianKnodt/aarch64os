@@ -274,7 +274,7 @@ pub struct VirtIOBlk<'a> {
 
 #[derive(Debug)]
 pub struct VirtIOBlkConfig {
-  capacity: LEU64,
+  pub(crate) capacity: LEU64,
   size_max: LEU32,
   seg_max: LEU32,
 

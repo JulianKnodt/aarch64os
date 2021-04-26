@@ -11,6 +11,10 @@ use crate::{
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FileDescriptor(u32);
 
+impl From<u32> for FileDescriptor {
+  fn from(v: u32) -> Self { FileDescriptor(v) }
+}
+
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FileMode {
@@ -249,7 +253,6 @@ impl From<u8> for INodeKind {
 }
 
 const MAGIC_NUMBER: u32 = 0x101_0_F_0ff;
-
 /// The superblock is where the block alloc maps are stored
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Superblock {
@@ -467,20 +470,21 @@ where
     fd.open_refs += 1;
     fd.offset = 0;
     fd.mode = mode;
+    self.open_counts[fd.inode as usize] += 1;
     Ok(FileDescriptor(i as u32))
   }
 
   /// Flushes the cache to ensure that all writes are persisted.
-  pub fn flush(&mut self) -> Result<(), ()> {
+  pub fn flush(&mut self) -> Result<(), FlushErr> {
     while let Some((inode, inode_num)) = self.inode_cache.pop() {
       self.save_inode(&inode, inode_num as usize)?;
     }
     Ok(())
   }
   /// Seeks inside of a file
-  pub fn seek(&mut self, FileDescriptor(fdi): FileDescriptor, s: SeekFrom) -> Result<(), ()> {
+  pub fn seek(&mut self, FileDescriptor(fdi): FileDescriptor, s: SeekFrom) -> Result<(), SeekErr> {
     let fdi = fdi as usize;
-    let fd = self.file_descs.get_mut(fdi).ok_or(())?;
+    let fd = self.file_descs.get_mut(fdi).ok_or(FileDescOOB::OOB)?;
     match s {
       SeekFrom::Start(v) => fd.offset = v,
       SeekFrom::End(v) => {
@@ -489,14 +493,14 @@ where
         let inode = self.load_inode(inode_num as usize)?;
         let dst = inode.size as i32 + v;
         if dst < 0 {
-          return Err(());
+          return Err(SeekErr::BeforeStart);
         }
         self.file_descs[fdi].offset = dst as u32;
       },
       SeekFrom::Current(v) => {
         let dst = fd.offset as i32 + v;
         if dst < 0 {
-          return Err(());
+          return Err(SeekErr::BeforeStart);
         }
         fd.offset = dst as u32;
       },
@@ -504,12 +508,16 @@ where
     Ok(())
   }
   /// Reads into dst from a given file.
-  pub fn read(&mut self, FileDescriptor(fdi): FileDescriptor, dst: &mut [u8]) -> Result<usize, ()> {
+  pub fn read(
+    &mut self,
+    FileDescriptor(fdi): FileDescriptor,
+    dst: &mut [u8],
+  ) -> Result<usize, ReadErr> {
     let fdi = fdi as usize;
-    let fd = self.file_descs.get(fdi).ok_or(())?;
+    let fd = self.file_descs.get(fdi).ok_or(FileDescOOB::OOB)?;
     let offset = fd.offset;
     if fd.mode == FileMode::W {
-      return Err(());
+      return Err(ReadErr::NotReadable);
     }
     let inode_num = fd.inode as usize;
     let inode = self.load_inode(inode_num)?;
@@ -520,11 +528,15 @@ where
     self.file_descs[fdi].offset += read as u32;
     Ok(read)
   }
-  pub fn write(&mut self, FileDescriptor(fdi): FileDescriptor, src: &[u8]) -> Result<usize, ()> {
+  pub fn write(
+    &mut self,
+    FileDescriptor(fdi): FileDescriptor,
+    src: &[u8],
+  ) -> Result<usize, WriteErr> {
     let fdi = fdi as usize;
-    let fd = self.file_descs.get(fdi).ok_or(())?;
+    let fd = self.file_descs.get(fdi).ok_or(FileDescOOB::OOB)?;
     if fd.mode == FileMode::R {
-      return Err(());
+      return Err(WriteErr::ReadOnly);
     }
     let offset = fd.offset;
     let inode_num = fd.inode as usize;
@@ -534,14 +546,14 @@ where
     }
     let (written, updated) = self.write_to_inode(&mut inode, src, offset)?;
     if updated {
-      self.save_inode(&inode, inode_num)?;
+      self.cache_inode(&inode, inode_num)?;
     }
     self.file_descs[fdi].offset += written as u32;
     Ok(written)
   }
-  pub fn stat(&mut self, FileDescriptor(fdi): FileDescriptor) -> Result<FileStat, ()> {
+  pub fn stat(&mut self, FileDescriptor(fdi): FileDescriptor) -> Result<FileStat, StatErr> {
     let fdi = fdi as usize;
-    let inode_num = self.file_descs.get(fdi).ok_or(())?.inode as usize;
+    let inode_num = self.file_descs.get(fdi).ok_or(FileDescOOB::OOB)?.inode as usize;
     let inode = self.load_inode(inode_num)?;
     Ok(FileStat { size: inode.size })
   }
@@ -563,7 +575,7 @@ where
     let offset = (i * core::mem::size_of::<INode>()) % B::BLOCK_SIZE;
     (bl, offset, wraps)
   }
-  fn load_inode(&mut self, i: usize) -> Result<INode, ()> {
+  fn load_inode(&mut self, i: usize) -> Result<INode, LoadINodeErr> {
     debug_assert!(
       self.inode_alloc_map.get(i),
       "Unallocated inode is being loaded {}",
@@ -581,23 +593,28 @@ where
     if !overlaps_end {
       let mut buf = [0; B::BLOCK_SIZE];
       let inode_end = offset + core::mem::size_of::<INode>();
-      self.gbi.read(self.inode_md, block, &mut buf[..inode_end])?;
+      self
+        .gbi
+        .read(self.inode_md, block, &mut buf[..inode_end])
+        .map_err(|_| LoadINodeErr::RWErr)?;
       Ok(INode::from_slice(&buf[offset..inode_end]))
     } else {
       let mut buf = [0u8; 2 * B::BLOCK_SIZE];
       self
         .gbi
-        .read(self.inode_md, block, &mut buf[..B::BLOCK_SIZE])?;
+        .read(self.inode_md, block, &mut buf[..B::BLOCK_SIZE])
+        .map_err(|_| LoadINodeErr::RWErr)?;
       self
         .gbi
-        .read(self.inode_md, block + 1, &mut buf[B::BLOCK_SIZE..])?;
+        .read(self.inode_md, block + 1, &mut buf[B::BLOCK_SIZE..])
+        .map_err(|_| LoadINodeErr::RWErr)?;
       Ok(INode::from_slice(
         &buf[offset..offset + core::mem::size_of::<INode>()],
       ))
     }
   }
 
-  fn cache_inode(&mut self, inode: &INode, i: usize) -> Result<(), ()> {
+  fn cache_inode(&mut self, inode: &INode, i: usize) -> Result<(), CacheINodeErr> {
     if let Some((prev, _)) = self
       .inode_cache
       .as_mut_slice()
@@ -607,44 +624,59 @@ where
       prev.clone_from(inode);
       return Ok(());
     }
-    if let Some((old, i)) = self.inode_cache.push_out_front((*inode, i as u32)) {
-      self.save_inode(&old, i as usize)?;
+    if let Some((old, old_i)) = self.inode_cache.push_out_front((*inode, i as u32)) {
+      assert_ne!(old_i as usize, i);
+      self.save_inode(&old, old_i as usize)?;
     }
     Ok(())
   }
 
-  fn save_inode(&mut self, inode: &INode, i: usize) -> Result<(), ()> {
+  fn save_inode(&mut self, inode: &INode, i: usize) -> Result<(), SaveINodeErr> {
     assert!(
       self.inode_alloc_map.get(i as usize),
       "Unallocated inode is being saved"
     );
+    self.inode_cache.remove_where(|(_, v)| *v as usize == i);
     let (block, offset, wraps) = Self::inode_block_and_offset_and_wraps(i);
     if !wraps {
       let mut buf = [0u8; B::BLOCK_SIZE];
-      self.gbi.read(self.inode_md, block, &mut buf)?;
+      self
+        .gbi
+        .read(self.inode_md, block, &mut buf)
+        .map_err(|_| SaveINodeErr::ReadFailed)?;
       inode.to_slice(&mut buf[offset..offset + core::mem::size_of::<INode>()]);
-      self.gbi.write(self.inode_md, block, &buf)?;
+      self
+        .gbi
+        .write(self.inode_md, block, &buf)
+        .map_err(|_| SaveINodeErr::WriteFailed)?;
     } else {
       let mut buf = [0u8; 2 * B::BLOCK_SIZE];
       self
         .gbi
-        .read(self.inode_md, block, &mut buf[..B::BLOCK_SIZE])?;
+        .read(self.inode_md, block, &mut buf[..B::BLOCK_SIZE])
+        .map_err(|_| SaveINodeErr::ReadFailed)?;
       self
         .gbi
-        .read(self.inode_md, block + 1, &mut buf[B::BLOCK_SIZE..])?;
+        .read(self.inode_md, block + 1, &mut buf[B::BLOCK_SIZE..])
+        .map_err(|_| SaveINodeErr::ReadFailed)?;
       inode.to_slice(&mut buf[offset..offset + core::mem::size_of::<INode>()]);
       self
         .gbi
-        .write(self.inode_md, block, &buf[..B::BLOCK_SIZE])?;
+        .write(self.inode_md, block, &buf[..B::BLOCK_SIZE])
+        .map_err(|_| SaveINodeErr::WriteFailed)?;
       self
         .gbi
-        .write(self.inode_md, block + 1, &buf[B::BLOCK_SIZE..])?;
+        .write(self.inode_md, block + 1, &buf[B::BLOCK_SIZE..])
+        .map_err(|_| SaveINodeErr::WriteFailed)?;
     }
     Ok(())
   }
   /// Given an inode, saves it and returns the inode number it was given
-  fn alloc_inode(&mut self, inode: &INode) -> Result<u32, ()> {
-    let inode_num = self.inode_alloc_map.find_free().ok_or(())? as u32;
+  fn alloc_inode(&mut self, inode: &INode) -> Result<u32, AllocINodeErr> {
+    let inode_num = self
+      .inode_alloc_map
+      .find_free()
+      .ok_or(AllocINodeErr::NoneFree)? as u32;
     self.inode_alloc_map.set(inode_num as usize);
     self.save_inode(inode, inode_num as usize)?;
     self.persist_allocs()?;
@@ -658,25 +690,29 @@ where
     FileDescriptor(fdi): FileDescriptor,
     path: &[&str],
     mode: FileMode,
-  ) -> Result<(FileDescriptor, (u32, INode, Directory)), ()> {
+  ) -> Result<(FileDescriptor, (u32, INode, Directory)), OpenErr> {
     if path.is_empty() {
       // Must have at least one entry in the path
-      return Err(());
+      return Err(OpenErr::MustProvideFileName);
     }
-    let mut curr_dir_inode_num = self.file_descs.get(fdi as usize).ok_or(())?.inode;
+    let mut curr_dir_inode_num = self
+      .file_descs
+      .get(fdi as usize)
+      .ok_or(FileDescOOB::OOB)?
+      .inode;
     let mut curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
     if curr_dir_inode.kind != INodeKind::Directory {
       // Can't create a file inside of something which isn't a directory
-      return Err(());
+      return Err(OpenErr::NotInsideDirectory);
     }
     let mut buf = [0u8; core::mem::size_of::<Directory>()];
     self.read_from_inode(&curr_dir_inode, &mut buf, 0)?;
     let mut curr_dir: Directory = unsafe { core::mem::transmute(buf) };
     for subdir in path.iter().take(path.len() - 1) {
-      curr_dir_inode_num = curr_dir.inode_of(subdir).ok_or(())?;
+      curr_dir_inode_num = curr_dir.inode_of(subdir).ok_or(OpenErr::PathDoesNotExist)?;
       curr_dir_inode = self.load_inode(curr_dir_inode_num as usize)?;
       if curr_dir_inode.kind != INodeKind::Directory {
-        return Err(());
+        return Err(OpenErr::NotInsideDirectory);
       }
       let mut buf: [u8; core::mem::size_of::<Directory>()] =
         unsafe { core::mem::transmute(curr_dir) };
@@ -687,11 +723,11 @@ where
     let inode_num = if let Some(inode_num) = curr_dir.inode_of(last_entry) {
       if mode == FileMode::New {
         // File already exists
-        return Err(());
+        return Err(OpenErr::NewButFileExists);
       }
       if self.open_counts[inode_num as usize] == u8::MAX {
         // Already opened too many files
-        return Err(());
+        return Err(OpenErr::FileOpenTooMuch);
       }
       inode_num
     } else if !matches!(mode, FileMode::R | FileMode::MustExist) {
@@ -708,7 +744,7 @@ where
       inode_num
     } else {
       debug_assert!(matches!(mode, FileMode::R | FileMode::MustExist));
-      return Err(());
+      return Err(OpenErr::ModeCannotCreateFile);
     };
     self.open_counts[inode_num as usize] += 1;
     let (i, fd) = self
@@ -716,7 +752,7 @@ where
       .iter_mut()
       .enumerate()
       .find(|(_, fd)| fd.open_refs == 0)
-      .ok_or(())?;
+      .ok_or(OpenErr::NoFreeFDs)?;
     fd.inode = inode_num;
     fd.offset = 0;
     fd.open_refs += 1;
@@ -734,17 +770,20 @@ where
     fd: FileDescriptor,
     path: &[&str],
     mode: FileMode,
-  ) -> Result<FileDescriptor, ()> {
+  ) -> Result<FileDescriptor, OpenErr> {
     self.open_with_dir(fd, path, mode).map(|v| v.0)
   }
-  /// Unlinks a file in the directory given by the file descriptor, following the path.
-  pub fn unlink(&mut self, fd: FileDescriptor, path: &[&str]) -> Result<(), ()> {
-    let (fd, (curr_dir_inode_num, mut curr_dir_inode, mut curr_dir)) =
-      self.open_with_dir(fd, path, FileMode::R)?;
 
-    let inode_num = self.file_descs[fd.0 as usize].inode as usize;
+  fn unlink_from_dir(
+    &mut self,
+    unlink_fd: FileDescriptor,
+    curr_dir_inode_num: u32,
+    mut curr_dir_inode: INode,
+    mut curr_dir: Directory,
+    last_entry: &str,
+  ) -> Result<(), UnlinkErr> {
+    let inode_num = self.file_descs[unlink_fd.0 as usize].inode as usize;
     let mut inode = self.load_inode(inode_num)?;
-    let last_entry = path.last().unwrap();
 
     curr_dir.remove(curr_dir.index_of(last_entry).unwrap());
     self.write_to_inode(&mut curr_dir_inode, curr_dir.ser(), 0)?;
@@ -752,13 +791,27 @@ where
 
     inode.refs -= 1;
     self.save_inode(&inode, inode_num)?;
-    self.close(fd)
+    self.close(unlink_fd)?;
+    Ok(())
   }
-  pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), ()> {
+
+  /// Unlinks a file in the directory given by the file descriptor, following the path.
+  pub fn unlink(&mut self, fd: FileDescriptor, path: &[&str]) -> Result<(), UnlinkErr> {
+    let (fd, (curr_dir_inode_num, curr_dir_inode, curr_dir)) =
+      self.open_with_dir(fd, path, FileMode::R)?;
+    self.unlink_from_dir(
+      fd,
+      curr_dir_inode_num,
+      curr_dir_inode,
+      curr_dir,
+      path.last().unwrap(),
+    )
+  }
+  pub fn close(&mut self, FileDescriptor(i): FileDescriptor) -> Result<(), CloseErr> {
     let i = i as usize;
     let open_file = &mut self.file_descs[i];
     if open_file.open_refs == 0 {
-      return Err(());
+      return Err(CloseErr::NotOpen);
     }
     open_file.open_refs -= 1;
     // If inode is no longer referenced here delete it
@@ -785,12 +838,15 @@ where
     Ok(())
   }
   /// Saves the allocation maps to disk
-  fn persist_allocs(&mut self) -> Result<(), ()> {
+  fn persist_allocs(&mut self) -> Result<(), PersistAllocsErr> {
     let mut buf = [0u8; { (NUM_INODE + NUM_DATA) / 8 }];
     assert!(buf.len() < B::BLOCK_SIZE);
     buf[..self.inode_alloc_map.items.len()].copy_from_slice(&self.inode_alloc_map.items);
     buf[self.inode_alloc_map.items.len()..].copy_from_slice(&self.data_alloc_map.items);
-    self.gbi.write(self.superblock, 0, &buf)?;
+    self
+      .gbi
+      .write(self.superblock, 0, &buf)
+      .map_err(|_| PersistAllocsErr::WriteErr)?;
     Ok(())
   }
   /// Loads the allocation maps from disk
@@ -809,7 +865,7 @@ where
     inode: &mut INode,
     data: &[u8],
     offset: u32,
-  ) -> Result<(usize, bool), ()> {
+  ) -> Result<(usize, bool), WriteToINodeErr> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
     let end_byte = offset + data.len() as u32;
     let updated = inode.size < end_byte;
@@ -817,13 +873,16 @@ where
     if end_block > 8 {
       // Not enough space in these files to write that much.
       // TODO lift this when I figure out a way to allocate more space
-      return Err(());
+      return Err(WriteToINodeErr::NotEnoughSpace);
     }
     let curr_blocks = (inode.size as usize + B::BLOCK_SIZE - 1) / B::BLOCK_SIZE;
     // TODO check the number of free data blocks before and abort early if so;
     if curr_blocks < end_block {
       for i in curr_blocks..end_block {
-        let free_db = self.data_alloc_map.find_free().ok_or(())?;
+        let free_db = self
+          .data_alloc_map
+          .find_free()
+          .ok_or(WriteToINodeErr::NoDataBlocks)?;
         inode.data_blocks[i] = free_db as u16;
         assert!(!self.data_alloc_map.get(free_db));
         self.data_alloc_map.set(free_db);
@@ -834,7 +893,10 @@ where
     let mut buf = [0; B::BLOCK_SIZE];
     for i in start_block..end_block as u32 {
       let db = inode.data_blocks[i as usize] as usize;
-      let read = self.gbi.read(self.data_md, db, &mut buf)?;
+      let read = self
+        .gbi
+        .read(self.data_md, db, &mut buf)
+        .map_err(|_| WriteToINodeErr::RWErr)?;
       debug_assert_eq!(read, B::BLOCK_SIZE);
       let start = (written + offset as usize) % B::BLOCK_SIZE;
       let end = B::BLOCK_SIZE.min(start + data.len() - written as usize);
@@ -842,29 +904,41 @@ where
       debug_assert_ne!(write_buf.len(), 0);
       write_buf.copy_from_slice(&data[written..written + write_buf.len()]);
       written += write_buf.len();
-      self.gbi.write(self.data_md, db, &buf)?;
+      self
+        .gbi
+        .write(self.data_md, db, &buf)
+        .map_err(|_| WriteToINodeErr::RWErr)?;
     }
     debug_assert_eq!(written, data.len());
     Ok((written, updated))
   }
   /// Writes a byte array to an inode
-  fn read_from_inode(&mut self, inode: &INode, dst: &mut [u8], offset: u32) -> Result<usize, ()> {
+  fn read_from_inode(
+    &mut self,
+    inode: &INode,
+    dst: &mut [u8],
+    offset: u32,
+  ) -> Result<usize, ReadFromINodeErr> {
     let start_block = offset / (B::BLOCK_SIZE as u32);
     let end_byte = offset + dst.len() as u32;
     let end_block = (end_byte as usize + B::BLOCK_SIZE - 1) / (B::BLOCK_SIZE);
     if end_block > 8 {
       // Reading past the end of the file
-      return Err(());
+      return Err(ReadFromINodeErr::ReadPastEnd);
     }
     let curr_blocks = (inode.size as usize + B::BLOCK_SIZE - 1) / B::BLOCK_SIZE;
     if curr_blocks < end_block {
-      return Err(());
+      return Err(ReadFromINodeErr::ReadPastEnd);
     }
     let mut read = 0;
     let mut buf = [0; B::BLOCK_SIZE];
     for i in start_block..end_block.min(curr_blocks) as u32 {
       let db = inode.data_blocks[i as usize] as usize;
-      assert_eq!(self.gbi.read(self.data_md, db, &mut buf)?, B::BLOCK_SIZE);
+      let amt_read = self
+        .gbi
+        .read(self.data_md, db, &mut buf)
+        .map_err(|_| ReadFromINodeErr::ReadErr)?;
+      assert_eq!(amt_read, B::BLOCK_SIZE);
       let start = (read + offset as usize) % B::BLOCK_SIZE;
       let end = B::BLOCK_SIZE.min(start + dst.len() - read as usize);
       let read_buf = &buf[start..end];
@@ -880,17 +954,23 @@ where
 
   /// Convenience function for getting a directory from a file descriptor which is expected to
   /// be a file.
-  pub fn as_directory(&mut self, fd: FileDescriptor) -> Result<Directory, ()> {
+  pub fn as_directory(&mut self, fd: FileDescriptor) -> Result<Directory, AsDirErr> {
     let mut buf = [0; core::mem::size_of::<Directory>()];
     self.seek(fd, SeekFrom::Start(0))?;
     self.read(fd, &mut buf)?;
     Ok(unsafe { core::mem::transmute(buf) })
   }
 
+  pub fn is_directory(&mut self, fd: FileDescriptor) -> Result<bool, IsDirErr> {
+    let fde = self.file_descs[fd.0 as usize];
+    let inode = self.load_inode(fde.inode as usize)?;
+    Ok(matches!(inode.kind, INodeKind::Directory))
+  }
+
   /// Function to convert an open file to a directory.
-  pub fn modify_kind(&mut self, fd: FileDescriptor, kind: INodeKind) -> Result<(), ()> {
+  pub fn modify_kind(&mut self, fd: FileDescriptor, kind: INodeKind) -> Result<(), ModifyKindErr> {
     let fdi = fd.0 as usize;
-    let inode_num = self.file_descs.get(fdi).ok_or(())?.inode as usize;
+    let inode_num = self.file_descs.get(fdi).ok_or(FileDescOOB::OOB)?.inode as usize;
     let mut inode = self.load_inode(inode_num)?;
     match (inode.kind, kind) {
       (a, b) if a == b => return Ok(()),
@@ -899,7 +979,7 @@ where
       (_, INodeKind::Contiguous) => todo!(),
       (_, INodeKind::Directory) =>
         if inode.size != core::mem::size_of::<Directory>() as u32 {
-          return Err(());
+          return Err(ModifyKindErr::DirSizeMismatch);
         },
     }
     inode.kind = kind;
@@ -907,8 +987,33 @@ where
     Ok(())
   }
 
+  /// Removes a directory from a given reference path with the given name
+  pub fn rmdir(&mut self, fd: FileDescriptor, path: &[&str]) -> Result<(), RmdirErr> {
+    let (fd, (curr_dir_inode_num, curr_dir_inode, curr_dir)) =
+      self.open_with_dir(fd, path, FileMode::MustExist)?;
+    if !self.is_directory(fd)? {
+      self.close(fd)?;
+      return Err(RmdirErr::NotDirectory);
+    }
+
+    let dir = self.as_directory(fd)?;
+    if !dir.is_empty() {
+      self.close(fd)?;
+      return Err(RmdirErr::NotEmpty);
+    }
+
+    self.unlink_from_dir(
+      fd,
+      curr_dir_inode_num,
+      curr_dir_inode,
+      curr_dir,
+      path.last().unwrap(),
+    )?;
+    Ok(())
+  }
+
   /// Convenience function to make a directory inside of another directory
-  pub fn mkdir(&mut self, fd: FileDescriptor, name: &str) -> Result<FileDescriptor, ()> {
+  pub fn mkdir(&mut self, fd: FileDescriptor, name: &str) -> Result<FileDescriptor, MkdirErr> {
     let new_fd = self.open(fd, &[name], FileMode::New)?;
     let fde = self.file_descs[fd.0 as usize];
     let own_fde = self.file_descs[new_fd.0 as usize];
@@ -917,4 +1022,132 @@ where
     self.modify_kind(new_fd, INodeKind::Directory)?;
     Ok(new_fd)
   }
+
+  /// Returns stat about the file system
+  pub fn fs_stats(&self) -> FsStats {
+    FsStats {
+      num_open_fds: self.file_descs.iter().filter(|fd| fd.open_refs > 0).count() as u32,
+      num_open_inodes: self.open_counts.iter().filter(|&&v| v > 0).count() as u32,
+    }
+  }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsStats {
+  num_open_fds: u32,
+  num_open_inodes: u32,
+}
+
+macro_rules! define_error {
+  ($name: ident: $( $own: ident ),* [] $( $nested_name: ident ( $nested: ty )),*) => {
+    #[derive(Debug, Clone, Copy)]
+    pub enum $name {
+      $( $own, )*
+      $( $nested_name($nested), )*
+    }
+    $(
+      impl From<$nested> for $name {
+        fn from(v: $nested) -> Self {
+          Self::$nested_name(v)
+        }
+      }
+    )*
+  }
+}
+
+define_error!(FileDescOOB: OOB []);
+define_error!(PersistAllocsErr: WriteErr []);
+define_error!(LoadINodeErr: RWErr []);
+define_error!(SaveINodeErr: WriteFailed, ReadFailed []);
+define_error!(CacheINodeErr: [] SaveINodeErr(SaveINodeErr));
+
+define_error!(ReadFromINodeErr: ReadPastEnd, ReadErr []);
+define_error!(WriteToINodeErr: NotEnoughSpace, NoDataBlocks, RWErr []);
+define_error!(
+  ReadErr:
+  NotReadable
+  []
+  ReadFromINodeErr(ReadFromINodeErr),
+  LoadINodeErr(LoadINodeErr),
+  FileDescOOB(FileDescOOB)
+);
+define_error!(
+  OpenErr:
+  PathDoesNotExist,
+  NewButFileExists,
+  MustProvideFileName,
+  ModeCannotCreateFile,
+  NotInsideDirectory,
+  NoFreeFDs,
+  FileOpenTooMuch
+  []
+  LoadINodeErr(LoadINodeErr),
+  PersistAllocsErr(PersistAllocsErr),
+  ReadFromINodeErr(ReadFromINodeErr),
+  SaveINodeErr(SaveINodeErr),
+  FileDescOOB(FileDescOOB),
+  AllocINodeErr(AllocINodeErr),
+  WriteToINodeErr(WriteToINodeErr)
+);
+define_error!(
+  CloseErr:
+  NotOpen
+  []
+  LoadINodeErr(LoadINodeErr),
+  SaveINodeErr(SaveINodeErr),
+  PersistAllocsErr(PersistAllocsErr)
+);
+
+define_error!(
+  UnlinkErr:
+  []
+  OpenErr(OpenErr),
+  SaveINodeErr(SaveINodeErr),
+  LoadINodeErr(LoadINodeErr),
+  CloseErr(CloseErr),
+  WriteToINodeErr(WriteToINodeErr)
+);
+define_error!(
+  SeekErr: BeforeStart [] LoadINodeErr(LoadINodeErr), FileDescOOB(FileDescOOB)
+);
+define_error!(StatErr: [] LoadINodeErr(LoadINodeErr), FileDescOOB(FileDescOOB));
+
+define_error!(
+  WriteErr:
+  ReadOnly [] LoadINodeErr(LoadINodeErr),
+  WriteToINodeErr(WriteToINodeErr),
+  FileDescOOB(FileDescOOB),
+  CacheINodeErr(CacheINodeErr)
+);
+define_error!(FlushErr: [] SaveINodeErr(SaveINodeErr));
+
+define_error!(MkdirErr: [] OpenErr(OpenErr), WriteErr(WriteErr), ModifyKindErr(ModifyKindErr));
+define_error!(
+  RmdirErr:
+  NotDirectory,
+  NotEmpty
+  []
+  OpenErr(OpenErr),
+  WriteErr(WriteErr),
+  UnlinkErr(UnlinkErr),
+  CloseErr(CloseErr),
+  IsDirErr(IsDirErr),
+  AsDirErr(AsDirErr)
+);
+define_error!(
+  IsDirErr: [] LoadINodeErr(LoadINodeErr)
+);
+define_error!(
+  ModifyKindErr:
+  DirSizeMismatch
+  []
+  LoadINodeErr(LoadINodeErr),
+  SaveINodeErr(SaveINodeErr),
+  FileDescOOB(FileDescOOB)
+);
+define_error!(
+  AsDirErr: [] SeekErr(SeekErr), ReadErr(ReadErr)
+);
+define_error!(
+  AllocINodeErr: NoneFree [] PersistAllocsErr(PersistAllocsErr), SaveINodeErr(SaveINodeErr)
+);

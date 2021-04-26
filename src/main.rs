@@ -6,6 +6,7 @@
   maybe_uninit_extra,
   const_generics,
   maybe_uninit_uninit_array,
+  maybe_uninit_slice,
   const_evaluatable_checked,
   array_methods,
   const_mut_refs,
@@ -14,6 +15,7 @@
   array_chunks,
   const_generics_defaults,
   specialization,
+  int_bits_const,
   generic_associated_types
 )]
 #![allow(incomplete_features)]
@@ -23,6 +25,7 @@ pub mod uart;
 pub mod utils;
 pub mod virtio;
 
+pub mod array_vec;
 pub mod bit_array;
 pub mod block_interface;
 pub mod fs;
@@ -144,7 +147,7 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
     let virtio_blk_cfg: VirtIOBlkConfig = unsafe {
       read_volatile(&virtio_blk.as_ref().unwrap().regs.config.native() as *const u64 as *const _)
     };
-    let _ = write!(uart, "Capacity {:?}\n", virtio_blk_cfg);
+    let _ = write!(uart, "Num. Sectors {:?}\n", virtio_blk_cfg.capacity);
 
     let mut gbi = GlobalBlockInterface::new(virtio_blk.unwrap());
     gbi.try_init().expect("Failed to init");
@@ -210,7 +213,16 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
           }
         },
         b"rmdir" => {
-          todo!();
+          let dir_name = words.next().and_then(|w| core::str::from_utf8(w).ok());
+          let dir_name = if let Some(dir_name) = dir_name {
+            dir_name
+          } else {
+            let _ = writeln!(uart, "Usage: fwriterand <dir_name>");
+            continue;
+          };
+          if let Err(err) = fs.rmdir(curr_dir, &[dir_name]) {
+            let _ = writeln!(uart, "Failed to rmdir {}: {:?}", dir_name, err);
+          }
         },
         b"cd" => {
           let w = words.next().and_then(|w| core::str::from_utf8(w).ok());
@@ -227,6 +239,9 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
               continue;
             },
           };
+          if let Err(err) = fs.close(curr_dir) {
+            let _ = write!(uart, "Could not properly close old directory: {:?}", err);
+          }
           curr_dir = next_dir;
         },
         b"rand" => {
@@ -234,44 +249,36 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
           virtio_entropy.read(&mut data);
           let _ = write!(uart, "Random: {:?}\n", &data);
         },
-        b"writerand" => {
-          let mut sector = words
+        b"fread" => {
+          let fd = words
             .next()
-            .and_then(|sec| from_utf8(sec).ok())
-            .and_then(|sec| sec.parse::<u64>().ok())
-            .unwrap_or(0);
-          let mut len = words
-            .next()
-            .and_then(|len| from_utf8(len).ok())
-            .and_then(|len| len.parse::<usize>().ok())
-            .unwrap_or(0);
-          while len > 0 {
-            let mut outdata: [u8; 512] = [0; 512];
-            let curlen = core::cmp::min(512, len);
-            {
-              let curbuf = &mut outdata[..curlen];
-              virtio_entropy.read(curbuf);
-              for b in curbuf.iter_mut() {
-                *b = ((*b as u32 * 100) / 272 + 32) as u8;
-              }
-            }
-            //gbi.block_device.write(sector, &outdata);
-            sector += 1;
-            len -= curlen;
-          }
-        },
-        b"read" => {
-          let sector = words
-            .next()
-            .and_then(|sec| from_utf8(sec).ok())
-            .and_then(|sec| sec.parse::<u64>().ok())
-            .unwrap_or(0);
+            .and_then(|fd| from_utf8(fd).ok())
+            .and_then(|fd| fd.parse::<u32>().ok());
+          let fd = if let Some(fd) = fd {
+            fs::FileDescriptor::from(fd)
+          } else {
+            let _ = writeln!(uart, "Usage: fread <file_descriptor> <len=512>");
+            continue;
+          };
           let mut len = words
             .next()
             .and_then(|len| from_utf8(len).ok())
             .and_then(|len| len.parse::<usize>().ok())
             .unwrap_or(512);
-          let mut data: [u8; 512] = [0; 512];
+          let mut data = [0; 512];
+          while len > 0 {
+            let rem = len.min(512);
+            match fs.read(fd, &mut data[..rem]) {
+              Ok(read) => {
+                len -= read;
+                uart.write_bytes(&data[..rem]);
+              },
+              Err(e) => {
+                let _ = writeln!(uart, "Failed to read from {:?}: {:?}", fd, e);
+                break;
+              },
+            }
+          }
           loop {
             //gbi.block_device.read(sector, &mut data);
             if len > 512 {
@@ -285,11 +292,14 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
           }
         },
         b"fwriterand" => {
-          let mut file_name = words.next().and_then(|v| from_utf8(v).ok());
-          let file_name = if let Some(file_name) = file_name {
-            file_name
+          let fd = words
+            .next()
+            .and_then(|fd| from_utf8(fd).ok())
+            .and_then(|fd| fd.parse::<u32>().ok());
+          let fd = if let Some(fd) = fd {
+            fs::FileDescriptor::from(fd)
           } else {
-            let _ = writeln!(uart, "Usage: fwrite <filename> <len=512>");
+            let _ = writeln!(uart, "Usage: fwriterand <file_descriptor> <len=512>");
             continue;
           };
 
@@ -299,44 +309,85 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
             .and_then(|len| len.parse::<usize>().ok())
             .unwrap_or(512);
 
-          let fd = match fs.open(curr_dir, &[file_name], fs::FileMode::RW) {
-            Ok(fd) => fd,
-            Err(()) => {
-              let _ = writeln!(uart, "Failed to open {}", file_name);
-              continue;
+          // just read from entropy for now
+          let mut data = [0u8; 512];
+          while len > 0 {
+            let rem = len.min(512);
+            virtio_entropy.read(&mut data[..rem]);
+            match fs.write(fd, &data[..rem]) {
+              Ok(written) if written == rem => {
+                len -= rem;
+              },
+              Ok(written) => {
+                let _ = writeln!(
+                  uart,
+                  "Failed to write full amount to {:?}, expected: {}, got: {}",
+                  fd, rem, written,
+                );
+                break;
+              },
+              Err(e) => {
+                let _ = writeln!(uart, "Failed to write to {:?}: {:?}", fd, e);
+                break;
+              },
+            }
+          }
+        },
+        b"fclose" => {
+          let fd = words
+            .next()
+            .and_then(|fd| from_utf8(fd).ok())
+            .and_then(|fd| fd.parse::<u32>().ok());
+          let fd = if let Some(fd) = fd {
+            fs::FileDescriptor::from(fd)
+          } else {
+            let _ = uart.write_str("Usage: fclose <file_descriptor>");
+            continue;
+          };
+          match fs.close(fd) {
+            Ok(()) => {},
+            Err(e) => {
+              let _ = writeln!(uart, "Failed to close {:?}: {:?}", fd, e);
+              break;
             },
           };
-
-          // just read from entropy for now for now;
-          let mut data = [0u8; 512];
-          virtio_entropy.read(&mut data);
-          let _ = write!(uart, "Random: {:?}\n", &data);
-
-          while len > 0 {
-            let mut outdata: [u8; 512] = [0; 512];
-            let curlen = core::cmp::min(512, len);
-            {
-              let curbuf = &mut outdata[..curlen];
-              for b in curbuf.iter_mut() {
-                *b = uart.read_byte();
-                if *b == b'\r' {
-                  *b = b'\n';
-                }
-                uart.write_byte(*b);
-              }
-            }
-            //gbi.block_device.write(sector, &outdata);
-            len -= curlen;
+        },
+        b"fseek" => {
+          let fd = words
+            .next()
+            .and_then(|fd| from_utf8(fd).ok())
+            .and_then(|fd| fd.parse::<u32>().ok());
+          let fd = if let Some(fd) = fd {
+            fs::FileDescriptor::from(fd)
+          } else {
+            let _ = uart.write_str("Usage: fseek <file_descriptor> <from_start=0>");
+            continue;
+          };
+          let seek_pos = words
+            .next()
+            .and_then(|len| from_utf8(len).ok())
+            .and_then(|len| len.parse::<u32>().ok())
+            .unwrap_or(0);
+          match fs.seek(fd, fs::SeekFrom::Start(seek_pos)) {
+            Ok(()) => {},
+            Err(err) => {
+              let _ = writeln!(uart, "Failed to seek for {:?}: {:?}", fd, err);
+            },
           }
         },
         b"exit" => {
-          fs.flush();
-          break
+          if let Err(e) = fs.flush() {
+            let _ = writeln!(uart, "Failed to flush: {:?}", e);
+          }
+          break;
         },
+        b"fs_stat" => {
+          let _ = writeln!(uart, "FS Stats: {:?}", fs.fs_stats());
+        }
         _ => {
-          let _ = write!(
+          let _ = writeln!(
             uart,
-            "Unknown command \"{}\"\n",
+            "Unknown command \"{}\"",
             from_utf8(line).unwrap_or("unknown")
           );
         },
