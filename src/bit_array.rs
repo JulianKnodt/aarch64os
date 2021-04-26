@@ -84,7 +84,7 @@ where
         return Some(first);
       }
     }
-    return None;
+    None
   }
 
   #[inline]

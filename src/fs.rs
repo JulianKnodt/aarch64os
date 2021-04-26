@@ -489,7 +489,6 @@ where
       SeekFrom::Start(v) => fd.offset = v,
       SeekFrom::End(v) => {
         let inode_num = fd.inode;
-        drop(fd);
         let inode = self.load_inode(inode_num as usize)?;
         let dst = inode.size as i32 + v;
         if dst < 0 {
@@ -587,7 +586,7 @@ where
       .iter()
       .find(|(_, num)| *num as usize == i)
     {
-      return Ok(inode.clone());
+      return Ok(*inode);
     }
     let (block, offset, overlaps_end) = Self::inode_block_and_offset_and_wraps(i);
     if !overlaps_end {

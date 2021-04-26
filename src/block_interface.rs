@@ -161,6 +161,7 @@ macro_rules! mk_metadata_enum {
           $( Self::$md_id(_) => <$md as Metadata>::LEN, )+
         }
       }
+      pub fn is_empty(&self) -> usize { self.len() == 0 }
       pub fn ser(&self) -> &[u8] {
         match self {
           $( Self::$md_id(v) => v.ser(),  )+
@@ -308,7 +309,7 @@ where
       assert_eq!(read, B::BLOCK_SIZE);
     }
     if u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) != MAGIC_NUMBER {
-      return self.persist().map_err(|p| InitErr::Persist(p));
+      return self.persist().map_err(InitErr::Persist);
     }
     // --- read free map
     let mut curr = 4;
@@ -379,10 +380,7 @@ where
     for i in 0..OWN_BLOCKS {
       let written = self
         .block_device
-        .write(
-          i as u32,
-          &mut buf[i * B::BLOCK_SIZE..(i + 1) * B::BLOCK_SIZE],
-        )
+        .write(i as u32, &buf[i * B::BLOCK_SIZE..(i + 1) * B::BLOCK_SIZE])
         .map_err(|_| PersistErr::FailedToWrite)?;
       assert_eq!(written, B::BLOCK_SIZE);
     }
