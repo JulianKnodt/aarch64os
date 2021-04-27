@@ -64,6 +64,12 @@ pub trait Metadata: 'static {
 
   fn insert(&self, b: u32) -> Result<Self, ()>
   where
+    Self: Sized, {
+    self.extend_from_slice(&[b])
+  }
+
+  fn extend_from_slice(&self, bs: &[u32]) -> Result<Self, ()>
+  where
     Self: Sized;
 
   fn remove(&self, b: u32) -> Result<Self, ()>
@@ -232,7 +238,7 @@ where
   // but its representation might be generalizable. For now just go with a bit array.
   free_map: BitArray<{ B::NUM_BLOCKS }>,
 
-  pub(crate) block_device: B,
+  block_device: B,
 }
 
 /// A capability for metadata.
@@ -537,4 +543,7 @@ where
         .sum::<usize>();
     num_bytes / B::BLOCK_SIZE
   }
+
+  #[cfg(test)]
+  pub(crate) fn block_device_mut(&mut self) -> &mut B { &mut self.block_device }
 }

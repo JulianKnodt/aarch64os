@@ -383,7 +383,7 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
         },
         b"fs_stat" => {
           let _ = writeln!(uart, "FS Stats: {:?}", fs.fs_stats());
-        }
+        },
         _ => {
           let _ = writeln!(
             uart,

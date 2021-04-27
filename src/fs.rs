@@ -230,12 +230,6 @@ impl INode {
       dst[8 + i * 2] = r;
     }
   }
-  fn data_block(&self, mut n: usize) -> u16 {
-    let mut curr = data_blocks[0];
-    while n > 0 {
-
-    }
-  }
 }
 
 #[repr(u8)]
@@ -289,6 +283,19 @@ impl Metadata for Superblock {
       ..*self
     })
   }
+  fn extend_from_slice(&self, bs: &[u32]) -> Result<Self, ()> {
+    if self.owned.is_some() {
+      return Err(());
+    }
+    if let &[b] = bs {
+      Ok(Self {
+        owned: Some([b]),
+        ..*self
+      })
+    } else {
+      Err(())
+    }
+  }
   fn remove(&self, b: u32) -> Result<Self, ()> {
     if self.owned != Some([b]) {
       return Err(());
@@ -315,21 +322,51 @@ impl Metadata for RangeMetadata {
   const LEN: usize = core::mem::size_of::<Self>();
   fn insert(&self, b: u32) -> Result<Self, ()> {
     if self.count == 0 {
-      return Ok(Self { start: b, count: 1 });
-    }
-    // Handle an extra block after the end of this one
-    if b == self.start + self.count {
-      return Ok(Self {
+      Ok(Self { start: b, count: 1 })
+    } else if b == self.start + self.count {
+      // Handle an extra block after the end of this one
+      Ok(Self {
         start: self.start,
         count: self.count + 1,
-      });
+      })
     } else if b == self.start.checked_sub(1).ok_or(())? {
-      return Ok(Self {
+      // Or before the beginning
+      Ok(Self {
         start: self.start - 1,
         count: self.count + 1,
-      });
+      })
+    } else {
+      Err(())
     }
-    Err(())
+  }
+
+  fn extend_from_slice(&self, bs: &[u32]) -> Result<Self, ()> {
+    let (&start, rest) = bs.split_first().ok_or(())?;
+    let mut prev = start;
+    for &curr in rest.iter() {
+      if curr - prev != 1 {
+        return Err(());
+      }
+      prev = curr;
+    }
+    if self.count == 0 {
+      Ok(Self {
+        start,
+        count: rest.len() as u32 + 1,
+      })
+    } else if start == self.start + self.count {
+      Ok(Self {
+        start: self.start,
+        count: self.count + 1 + rest.len() as u32,
+      })
+    } else if self.start == start + rest.len() as u32 + 1 {
+      Ok(Self {
+        start,
+        count: self.count + 1 + rest.len() as u32,
+      })
+    } else {
+      Err(())
+    }
   }
 
   fn remove(&self, _b: u32) -> Result<Self, ()> {
