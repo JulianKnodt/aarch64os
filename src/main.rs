@@ -239,6 +239,22 @@ pub extern "C" fn kernel_main(dtb: &device_tree::DeviceTree) {
               continue;
             },
           };
+          match fs.is_directory(next_dir) {
+            Ok(true) => {},
+            Ok(false) => {
+              let _ = writeln!(uart, "cannot cd into {:?}: not a directory", dir_name);
+              let _ = fs.close(next_dir);
+              continue;
+            },
+            Err(err) => {
+              let _ = write!(
+                uart,
+                "Could not determine if {:?} is dir: {:?}",
+                dir_name, err
+              );
+              continue;
+            },
+          }
           if let Err(err) = fs.close(curr_dir) {
             let _ = write!(uart, "Could not properly close old directory: {:?}", err);
           }

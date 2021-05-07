@@ -963,6 +963,7 @@ where
     let start_block = offset / (B::BLOCK_SIZE as u32);
     let end_byte = offset + dst.len() as u32;
     let end_block = (end_byte as usize + B::BLOCK_SIZE - 1) / (B::BLOCK_SIZE);
+    // TODO check if we're reading up to the end and just return nothing if so.
     if end_block > 8 {
       // Reading past the end of the file
       return Err(ReadFromINodeErr::ReadPastEnd);

@@ -233,6 +233,7 @@ where
   // TODO convert this to one field with below.
   stored: [Option<AllMetadata>; MD_SPACE],
   owners: [Owner; MD_SPACE],
+  owner_id_map: BitArray<64>,
 
   // There should be a free_map per block-device,
   // but its representation might be generalizable. For now just go with a bit array.
@@ -294,6 +295,7 @@ where
     Self {
       stored,
       owners: [Owner::NoOwner; MD_SPACE],
+      owner_id_map: BitArray::new(false),
       free_map,
       block_device,
     }
